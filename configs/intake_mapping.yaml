@@ -1,0 +1,178 @@
+# Reviewed intake mapping for the bank dataset in data/raw.
+#
+# Started from `intake discover` (configs/intake_mapping.draft.yaml), then reviewed by hand:
+#   * merchant is used to ENRICH txn_event with the merchant category code (primary_mcc)
+#     instead of being dropped.
+#   * Date/timestamp columns that are not the event time are dropped as fields: as values
+#     they are near-unique strings that flood the tokenizer vocabulary, and some of them
+#     (posted / settlement / disposition times) are only known AFTER the event time.
+#   * Outcome columns that would leak the probe labels into the static profile are dropped
+#     (customer_is_active, relationship_close_date): profiles are not cut at the label
+#     eval point the way events are.
+#   * The data runs to 2028-09-30, so the pipeline pins intake's clock (`--now 2028-10-13`).
+#     Otherwise drop_future_events would discard every event after today's date.
+client: bank
+source: data/raw
+options:
+  timezone: UTC
+  drop_future_events: true
+tables:
+  # ------------------------------------------------------------------ profile
+  customer_profile:
+    shape: entity_master
+    entity: customer_id
+    lifelong:
+    - relationship_open_date
+    - acc_cre_ts
+    - kyc_last_review_date
+    fields:
+      drop:
+      - customer_is_active          # label leakage (churn)
+      - relationship_close_date     # label leakage (churn)
+
+  # ------------------------------------------------------------------ transactions
+  txn_event:
+    shape: event_stream
+    entity: customer_id
+    time: record_available_timestamp   # when the bank actually knew about the record
+    source_name: transaction
+    fields:
+      numeric: [amount, fx_rate, balance_before]
+      drop:
+      - txn_event_id
+      - link_reference
+      - linked_event_id
+      - product_id
+      - merchant_id
+      - reversed_transaction_id
+      - account_number_masked
+      - alert_id
+      - event_timestamp
+      - posted_timestamp
+      - settlement_timestamp
+  merchant:
+    shape: dimension
+    action: enrich
+    enrich_into: txn_event
+    enrich_on: merchant_id
+    fields:
+      include: [primary_mcc]
+  product_snapshot:
+    shape: periodic_snapshot
+    entity: customer_id
+    time: snapshot_date
+    source_name: transaction
+    emit: changes_only
+    snapshot_of: product_id
+    fields:
+      numeric: [current_balance, credit_limit, overdue_amount, overdue_principal_amt,
+                principal_amount, sanctioned_amount, instalment_amount, minimum_due]
+      drop:
+      - product_id
+      - account_number_masked
+      - linked_product_id
+      - open_date
+      - close_date
+      - delinquency_start_date
+      - last_statement_date
+      - last_due_date
+  product_event:
+    shape: event_stream
+    entity: customer_id
+    time: event_date
+    source_name: transaction
+    fields:
+      numeric: [old_limit, new_limit, approved_amount]
+      drop:
+      - prd_event_id
+      - product_id
+      - application_id
+
+  # ------------------------------------------------------------------ app
+  session:
+    shape: event_stream
+    entity: customer_id
+    time: session_start
+    source_name: app
+    fields:
+      drop:
+      - session_id
+      - session_end
+      - device_id
+      - ip_address_hash
+      - geo_location_hash
+  interaction_event:
+    shape: event_stream
+    entity: customer_id
+    time: event_time
+    source_name: app
+    fields:
+      numeric: [amt_txn]
+      drop:
+      - event_id
+      - session_id
+      - event_sequence_number
+      - transaction_id
+  customer_snapshot:
+    shape: periodic_snapshot
+    entity: customer_id
+    time: snapshot_date
+    source_name: app
+    emit: changes_only
+    fields:
+      numeric: [credit_score_bureau, credit_score_internal, total_aum]
+      drop:
+      - credit_score_bureau_date
+      - credit_score_internal_date
+
+  # ------------------------------------------------------------------ communication
+  fraud_case:
+    shape: event_stream
+    entity: customer_id
+    time: alert_timestamp
+    source_name: communication
+    fields:
+      drop:
+      - alert_id
+      - fraud_case_id
+      - case_open_timestamp
+  fraud_case_snapshot:
+    shape: child_of_event
+    time: snapshot_date
+    source_name: communication
+    resolve_entity_via:
+      parent: fraud_case
+      key: alert_id
+    fields:
+      numeric: [total_exposure_amount, confirmed_loss_amount]
+      drop:
+      - alert_id
+      - disposition_timestamp
+  collections_case:
+    shape: event_stream
+    entity: customer_id
+    time: case_open_timestamp
+    source_name: communication
+    fields:
+      numeric: [outstanding_at_assignment, promise_amount, instalment_amount,
+                total_arrangement_amount]
+      drop:
+      - collection_case_id
+      - product_id
+      - promise_made_timestamp
+      - promise_date
+      - arrangement_start_date
+  collections_case_snapshot:
+    shape: child_of_event
+    time: snapshot_date
+    source_name: communication
+    resolve_entity_via:
+      parent: collections_case
+      key: collection_case_id
+    fields:
+      numeric: [amount_collected_to_date, action_amount_collected, writeoff_amount,
+                recovery_amount]
+      drop:
+      - collection_case_id
+      - action_id
+      - action_timestamp

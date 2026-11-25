@@ -1,0 +1,274 @@
+"""Typer CLI — a thin wrapper: parse args, call :mod:`pragmatiq.api`, print.
+
+No logic lives here (global rule 1). Command results print to stdout;
+progress and log output go to stderr.
+
+Path-like parameters are typed ``str``, not :class:`~pathlib.Path`: any of
+them may be a remote URL (``s3://…``), and ``Path("s3://b/k")`` collapses the
+double slash to ``s3:/b/k`` — a local path. The api layer accepts both.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sys
+
+import typer
+
+app = typer.Typer(name="pragmatiq", help="pragmatiq: behavioral foundation model for banking events.",
+                  no_args_is_help=True, pretty_exceptions_show_locals=False)
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        from pragmatiq import __version__
+
+        typer.echo(f"pragmatiq {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _setup(
+    ctx: typer.Context,
+    verbose: bool = typer.Option(True, "--verbose/--quiet",
+                                 help="Show INFO-level progress logs on stderr."),
+    version: bool = typer.Option(False, "--version", callback=_version_callback, is_eager=True,
+                                 help="Print the pragmatiq version and exit."),
+) -> None:
+    ctx.obj = {"verbose": verbose}
+    logging.basicConfig(level=logging.INFO if verbose else logging.WARNING,
+                        stream=sys.stderr, format="%(message)s")
+
+
+@app.command("tokenize")
+def tokenize_cmd(
+    data_dir: str = typer.Argument(..., help="Data contract directory (events/profiles parquet, e.g. intake output)."),
+    out: str = typer.Option("data/tokenized", help="Output (shards + tokenizer + index)."),
+    config: str | None = typer.Option(None, help="Tokenizer YAML (configs/data/tokenizer.yaml)."),
+    tokenizer_dir: str | None = typer.Option(None, help="Reuse an existing tokenizer dir."),
+    max_users: int | None = typer.Option(None, help="Cap users (debug)."),
+    n_workers: int = typer.Option(0, help="Parallel encode workers (<=1 = inline)."),
+) -> None:
+    """Fit/apply the tokenizer and write tokenized shards + LMDB index."""
+    from pragmatiq import api
+
+    manifest = api.tokenize(data_dir=data_dir, out=out, config=config,
+                            tokenizer_dir=tokenizer_dir, max_users=max_users,
+                            n_workers=n_workers)
+    typer.echo(json.dumps(manifest, indent=2))
+
+
+@app.command("pretrain")
+def pretrain_cmd(
+    ctx: typer.Context,
+    shard_dir: str = typer.Argument(..., help="Tokenized shard directory."),
+    run_name: str = typer.Option(..., "--name", help="Run name (runs/{name})."),
+    model_size: str = typer.Option("small", help="small | medium | large."),
+    config: str | None = typer.Option(
+        "auto", help="Pretrain YAML (configs/pretrain.yaml), or 'auto' to size the batch and "
+                     "schedule from the data and the device."),
+    runs_root: str = typer.Option("runs", help="Runs root directory."),
+    resume: str | None = typer.Option(None, help="'auto' to resume runs/{name}/checkpoints/last.pt."),
+    wandb: bool = typer.Option(False, "--wandb",
+                               help="Mirror metrics to Weights & Biases (needs the [tracking] extra)."),
+    show_config: bool = typer.Option(False, "--show-config",
+                                     help="Print the resolved training + model config as JSON "
+                                          "and exit without training."),
+) -> None:
+    """Pretrain a pragmatiq model (MLM) on tokenized shards."""
+    from pragmatiq import api
+
+    # Only forward non-default flags, so `wandb: true` / `verbose:` in the
+    # YAML still win over CLI defaults.
+    overrides: dict = {}
+    if wandb:
+        overrides["wandb"] = True
+    if ctx.obj and not ctx.obj.get("verbose", True):
+        overrides["verbose"] = False  # --quiet also silences the heartbeat
+    if show_config:
+        plan = api.pretrain_plan(shard_dir, model_size=model_size, config=config, run_name=run_name,
+                                 runs_root=runs_root, resume=resume, **overrides)
+        typer.echo(json.dumps(plan, indent=2, default=str))
+        return
+    summary = api.pretrain(shard_dir, run_name, model_size=model_size, config=config,
+                           runs_root=runs_root, resume=resume, **overrides)
+    typer.echo(json.dumps(summary, indent=2))
+
+
+@app.command("probe")
+def probe_cmd(
+    shard_dir: str = typer.Argument(..., help="Tokenized shard directory."),
+    run: str = typer.Option(..., help="Run directory of a trained model."),
+    label: str = typer.Option(..., help="Label parquet (labels/<task>.parquet)."),
+    device: str = typer.Option("auto", help="auto | cpu | cuda."),
+    probe_model: str = typer.Option("gbdt", help="Probe head: gbdt | logistic | lightgbm."),
+    seed: int = typer.Option(0, help="Probe random seed (for reproducible AUCs)."),
+    staleness_window: str | None = typer.Option(
+        None, help="Drop the most recent window of history before each eval point "
+                   "(e.g. 6h, 1d): the paper's event-staleness robustness check."),
+) -> None:
+    """Probe a trained model on a label table; reports ROC-AUC + PR-AUC vs baseline."""
+    from pragmatiq import api
+
+    typer.echo(json.dumps(
+        api.probe(shard_dir, run, label, device=device, probe_model=probe_model, seed=seed,
+                  staleness_window=staleness_window), indent=2))
+
+
+@app.command("uplift")
+def uplift_cmd(
+    shard_dir: str = typer.Argument(..., help="Tokenized shard directory."),
+    run: str = typer.Option(..., help="Run directory of a trained model."),
+    label: str = typer.Option(..., help="comm_uplift label parquet (labels/comm_uplift.parquet)."),
+    device: str = typer.Option("auto", help="auto | cpu | cuda."),
+    learner: str = typer.Option("t", help="uplift meta-learner: t (two-model) | s (single-model)."),
+) -> None:
+    """Evaluate campaign uplift on a trained model; reports Qini vs an oracle Qini."""
+    from pragmatiq import api
+
+    typer.echo(json.dumps(api.uplift(shard_dir, run, label, device=device, learner=learner), indent=2))
+
+
+@app.command("finetune")
+def finetune_cmd(
+    shard_dir: str = typer.Argument(..., help="Tokenized shard directory."),
+    run: str = typer.Option(..., help="Run directory of a trained model."),
+    label: str = typer.Option(..., help="Label parquet (labels/<task>.parquet)."),
+    config: str | None = typer.Option(None, help="Finetune YAML (see configs/finetune/credit.yaml)."),
+    device: str = typer.Option("auto", help="auto | cpu | cuda."),
+) -> None:
+    """LoRA fine-tune a trained model's adapters + head on a label table."""
+    from pragmatiq import api
+
+    typer.echo(json.dumps(api.finetune(shard_dir, run, label, config=config, device=device), indent=2))
+
+
+@app.command("embed")
+def embed_cmd(
+    shard_dir: str = typer.Argument(..., help="Tokenized shard directory."),
+    run: str = typer.Option(..., help="Run directory of a trained model."),
+    out: str = typer.Option("embeddings.parquet", help="Output parquet."),
+    device: str = typer.Option("auto", help="auto | cpu | cuda."),
+) -> None:
+    """Embed all users to a parquet of user_id + embedding."""
+    from pragmatiq import api
+
+    typer.echo(json.dumps(api.embed(shard_dir, run, out=out, device=device), indent=2))
+
+
+@app.command("pipeline")
+def pipeline_cmd(
+    data_dir: str = typer.Argument(..., help="Data contract directory (events/profiles parquet + labels/)."),
+    out: str = typer.Option("runs/pipeline", help="Output root (tok/, runs/, embeddings.parquet)."),
+    label: list[str] | None = typer.Option(None, help="Label parquet(s) to probe; default: <data_dir>/labels/*."),
+    model_size: str = typer.Option("nano", help="nano | small | medium | large."),
+    max_steps: int = typer.Option(400, help="Pretrain steps."),
+    token_budget: int = typer.Option(8192, help="Tokens per pretraining step."),
+    tokenizer_config: str | None = typer.Option(None, help="Tokenizer YAML (configs/data/tokenizer.yaml)."),
+    n_workers: int = typer.Option(0, help="Parallel tokenize workers (<=1 = inline)."),
+    device: str = typer.Option("auto", help="auto | cpu | cuda."),
+    probe_model: str = typer.Option("gbdt", help="Probe head: gbdt | logistic | lightgbm."),
+    seed: int = typer.Option(0, help="Pretrain + probe seed."),
+) -> None:
+    """End-to-end on real data: validate -> tokenize -> pretrain -> embed -> probe."""
+    from pragmatiq import api
+
+    res = api.pipeline(data_dir, out=out, labels=label or None, model_size=model_size,
+                       max_steps=max_steps, token_budget=token_budget,
+                       tokenizer_config=tokenizer_config, n_workers=n_workers, device=device,
+                       probe_model=probe_model, seed=seed)
+    typer.echo(json.dumps(res, indent=2, default=str))
+
+
+@app.command("info")
+def info_cmd() -> None:
+    """Describe this installation: versions, device, kernels, extras, env vars."""
+    from pragmatiq import api
+
+    typer.echo(json.dumps(api.info(), indent=2))
+
+
+@app.command("validate")
+def validate_cmd(
+    data_dir: str = typer.Argument(..., help="Raw dataset directory."),
+) -> None:
+    """Validate a raw dataset against the data contract."""
+    from pragmatiq import api
+
+    res = api.validate(data_dir)
+    typer.echo(res["summary"])
+    raise typer.Exit(code=0 if res["ok"] else 1)
+
+
+@app.command("export")
+def export_cmd(
+    run: str = typer.Option(..., help="Run directory of a trained model."),
+    shard_dir: str = typer.Argument(..., help="Tokenized shard directory (for an example user)."),
+    out: str = typer.Option("pragmatiq_embedder.onnx", help="Output ONNX path."),
+    device: str = typer.Option("auto", help="Accepted for symmetry; the graph is built on CPU."),
+) -> None:
+    """Export the padded-embedder ONNX variant (varlen caveat documented)."""
+    from pragmatiq import api
+
+    typer.echo(json.dumps(api.export(run, shard_dir, out=out, device=device), indent=2))
+
+
+@app.command("benchmark")
+def benchmark_cmd(
+    run: str = typer.Option(..., help="Run directory of a trained model."),
+    shard_dir: str = typer.Argument(..., help="Tokenized shard directory."),
+    device: str = typer.Option("auto", help="auto | cpu | cuda."),
+    out: str = typer.Option("benchmark_results.md", help="Results markdown."),
+    precision: str = typer.Option("auto", help="auto | bf16 | fp32 (CUDA autocast dtype)."),
+) -> None:
+    """Benchmark batch-embedding throughput; writes RESULTS.md."""
+    from pragmatiq import api
+
+    typer.echo(json.dumps(api.benchmark(run, shard_dir, device=device, out=out, precision=precision),
+                          indent=2))
+
+
+@app.command("gnn")
+def gnn_cmd(
+    shard_dir: str = typer.Argument(..., help="Tokenized shard directory."),
+    run: str = typer.Option(..., help="Run directory of a trained model."),
+    transfers: str = typer.Option(..., help="transfers.parquet."),
+    aml_label: str = typer.Option(..., help="labels/aml.parquet."),
+    seeds: str = typer.Option("0,1,2", help="Comma-separated seeds."),
+    epochs: int = typer.Option(150, help="GraphSAGE epochs."),
+    device: str = typer.Option("auto", help="auto | cpu | cuda."),
+) -> None:
+    """Run the four-arm AML GNN ablation (isolated vs GNN+PRAGMA vs GNN+handcrafted vs no-graph control)."""
+    from pragmatiq import api
+
+    seed_tuple = tuple(int(s) for s in seeds.split(","))
+    res = api.gnn(shard_dir, run, transfers, aml_label, seeds=seed_tuple, epochs=epochs, device=device)
+    typer.echo(json.dumps(res, indent=2))
+
+
+runs_app = typer.Typer(help="Inspect runs.", no_args_is_help=True)
+app.add_typer(runs_app, name="runs")
+
+
+@runs_app.command("list")
+def runs_list(runs_root: str = typer.Option("runs", help="Runs root.")) -> None:
+    """List runs with their last logged step/loss."""
+    from pragmatiq import api
+
+    typer.echo(json.dumps(api.runs_list(runs_root), indent=2))
+
+
+@runs_app.command("compare")
+def runs_compare(
+    names: list[str] = typer.Argument(..., help="Run names to compare."),
+    runs_root: str = typer.Option("runs", help="Runs root."),
+) -> None:
+    """Compare the last metrics of several runs side by side."""
+    from pragmatiq import api
+
+    typer.echo(json.dumps(api.runs_compare(names, runs_root), indent=2))
+
+
+if __name__ == "__main__":
+    app()

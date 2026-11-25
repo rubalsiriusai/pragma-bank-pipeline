@@ -1,0 +1,38 @@
+# Data and run artefacts never go to GitHub: they are large (files over 100 MB) and
+# customer-level bank data. Anchored with a leading "/" so they never match source
+# folders such as pragmatiq/pragmatiq/data/.
+/data/
+/outputs/
+/runs/
+*.parquet
+*.lmdb
+
+# Real-customer test fixture: rebuilt locally with scripts/build_test_fixture.py
+/pragmatiq/tests/fixtures/real_sample/
+
+# Python environments and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.claude/
+.ipynb_checkpoints/
+
+# Secrets and local settings
+.env
+.env.*
+*.pem
+.aws/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

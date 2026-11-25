@@ -1,0 +1,74 @@
+---
+title: Install
+description: Get pragmatiq running locally — Python 3.11+, a virtual environment, and optional extras.
+---
+
+> pragmatiq is an independent implementation inspired by the PRAGMA paper
+> ([arXiv 2604.08649](https://arxiv.org/abs/2604.08649)) and is not affiliated with or endorsed by Revolut.
+
+pragmatiq is **GPU-first and CPU-complete**: every command picks a CUDA device when one is
+visible (bf16 at inference, bf16-mixed in training, flash-attn's varlen kernel when
+installed) and runs the same code in fp32 on a CPU when none is — slower, same results
+contract.
+
+## Requirements
+
+- **Python 3.11+** and **torch 2.6+**
+- A virtual environment (recommended, so the install is isolated)
+- A GPU is recommended, not required; `flash-attn >= 2.4.1` (a wheel matching your torch /
+  CUDA build) is optional and enables the padding-free attention kernel
+
+## Install
+
+```bash
+git clone https://github.com/dynamiq-ai/pragmatiq.git
+cd pragmatiq
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev,full]"
+```
+
+`.[dev]` adds the test/lint tooling (pytest, ruff, mypy) and `.[full]` pulls in every
+optional extra — the combination CI installs, so the full test suite is green. Run the
+dev commands from the virtual environment so they match CI.
+
+## Optional extras
+
+The plain install is the slim inference core: validating, tokenizing, embedding with a
+trained run, the gradient-boosting probe, and LoRA fine-tuning all work without any
+extra. Pretraining needs `.[train]`. The extras add focused tooling:
+
+| Extra | For |
+| --- | --- |
+| `.[train]` | pretraining (Lightning) + the realism report (matplotlib) |
+| `.[serve]` | slim ONNX/Triton export and serving (no Lightning / torch-geometric / transformers) |
+| `.[aml]` | the GraphSAGE transfer-graph ablation (torch-geometric) |
+| `.[text]` | the frozen-text-embedding variant (`transformers`) |
+| `.[tracking]` | experiment tracking (Weights & Biases, TensorBoard) |
+| `.[data]` | the synthetic realism report (matplotlib) |
+| `.[gbdt]` | `--probe-model lightgbm` (the default probe uses sklearn, no extra needed) |
+| `.[demo]` | the Streamlit demo |
+| `.[full]` | everything above |
+| `.[dev]` | the test/lint toolchain |
+
+```bash
+pip install -e ".[train]"   # or .[full], .[dev,full], ... — combine as needed
+```
+
+## Verify
+
+```bash
+pragmatiq info            # resolved device (cuda / cpu), precision, flash-attn, extras
+pytest -q                 # the test suite
+ruff check . && mypy pragmatiq
+bash scripts/gates/gate_8.sh   # the nano end-to-end pipeline smoke
+```
+
+## Running on GPU
+
+Nothing to configure: `device="auto"` is the default everywhere, `PRAGMATIQ_DEVICE=cpu`
+pins the CPU on a GPU host, and `PRAGMATIQ_INFERENCE_PRECISION=fp32` disables the bf16
+autocast at inference. The README section
+[Running on GPU](https://github.com/dynamiq-ai/pragmatiq#running-on-gpu) covers flash-attn
+wheels, the deterministic path, and the measured hardware table.
+
+Then run the [Quickstart](/docs/get-started/quickstart) to see the whole pipeline end to end.

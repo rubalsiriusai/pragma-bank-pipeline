@@ -1,0 +1,12 @@
+# Store text with LF line endings so shell scripts run on the Linux VM.
+* text=auto eol=lf
+*.sh  text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files: never convert line endings.
+*.pdf     binary
+*.png     binary
+*.jpg     binary
+*.ico     binary
+*.parquet binary
